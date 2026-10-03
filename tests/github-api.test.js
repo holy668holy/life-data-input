@@ -6,8 +6,10 @@ import {
   GitHubApiError,
   GitHubAuthError,
   GitHubConflictError,
+  appendResentRecord,
   appendToDailyLog,
   fetchDailyLog,
+  fetchProcessedThrough,
   isConflict,
 } from "../github-api.js";
 
@@ -112,7 +114,7 @@ describe("appendToDailyLog", () => {
       fileResponse("## a (10:00)\n\n## x (10:30)\n", "new"),
       { status: 200, body: {} },
     ]);
-    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## b (11:00)", 0);
+    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## b (11:00)", { retryBaseDelayMs: 0 });
     assert.deepEqual(
       { sha: putBody(calls[3]).sha, content: result.content },
       { sha: "new", content: "## a (10:00)\n\n## x (10:30)\n\n## b (11:00)\n" },
@@ -125,13 +127,42 @@ describe("appendToDailyLog", () => {
       responses.push(fileResponse("## a (10:00)\n"), { status: 409, body: {} });
     }
     mockFetch(responses);
-    await assert.rejects(appendToDailyLog(TOKEN, REPO, DATE, "## b (11:00)", 0), GitHubConflictError);
+    await assert.rejects(appendToDailyLog(TOKEN, REPO, DATE, "## b (11:00)", { retryBaseDelayMs: 0 }), GitHubConflictError);
   });
 
-  test("同じエントリが既にあれば書き込まずに重複として返す", async () => {
+  test("重複判定を指定すると、同じエントリが既にあれば書き込まずに重複として返す", async () => {
     const calls = mockFetch([fileResponse("## a (10:00)\n")]);
-    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## a (10:00)");
+    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## a (10:00)", { skipIfDuplicate: true });
     assert.deepEqual({ isDuplicate: result.isDuplicate, callCount: calls.length }, { isDuplicate: true, callCount: 1 });
+  });
+
+  test("既定では同じエントリがあっても追記する（新規送信は重複判定しない）", async () => {
+    const calls = mockFetch([fileResponse("## a (10:00)\n", "abc"), { status: 200, body: {} }]);
+    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## a (10:00)");
+    assert.deepEqual(
+      { isDuplicate: result.isDuplicate, content: result.content, callCount: calls.length },
+      { isDuplicate: false, content: "## a (10:00)\n\n## a (10:00)\n", callCount: 2 },
+    );
+  });
+
+  test("重複判定は前方一致では重複としない", async () => {
+    const calls = mockFetch([fileResponse("## 牛乳を買った (10:00)\n200円\n", "abc"), { status: 200, body: {} }]);
+    const result = await appendToDailyLog(TOKEN, REPO, DATE, "## 牛乳を買った (10:00)", { skipIfDuplicate: true });
+    assert.deepEqual({ isDuplicate: result.isDuplicate, callCount: calls.length }, { isDuplicate: false, callCount: 2 });
+  });
+
+  test("新規作成時の 422 は取得し直し、sha を付けて書き込む", async () => {
+    const calls = mockFetch([
+      { status: 404, body: {} },
+      { status: 422, body: {} },
+      fileResponse("## x (10:30)\n", "created"),
+      { status: 200, body: {} },
+    ]);
+    await appendToDailyLog(TOKEN, REPO, DATE, "## b (11:00)", { retryBaseDelayMs: 0 });
+    assert.deepEqual(
+      { firstHasSha: "sha" in putBody(calls[1]), retrySha: putBody(calls[3]).sha },
+      { firstHasSha: false, retrySha: "created" },
+    );
   });
 
   test("書き込み時の 403 は認証エラーにする", async () => {
@@ -160,5 +191,102 @@ describe("isConflict", () => {
 
   test("sha 付きで送った 422 は競合ではない", () => {
     assert.equal(isConflict(422, true), false);
+  });
+});
+
+/** 状態ファイルの GET 応答を作る */
+function stateResponse(processedThrough) {
+  return fileResponse(JSON.stringify({ processed_through: processedThrough }), "state-sha");
+}
+
+describe("fetchProcessedThrough", () => {
+  test("状態ファイルの processed_through を返す", async () => {
+    const calls = mockFetch([stateResponse("2026-09-28")]);
+    assert.deepEqual(
+      { value: await fetchProcessedThrough(TOKEN, REPO), url: calls[0].url },
+      {
+        value: "2026-09-28",
+        url: "https://api.github.com/repos/holy668holy/life-data/contents/daily-log/.claude_integration_state.json",
+      },
+    );
+  });
+
+  test("状態ファイルが無ければ null を返す", async () => {
+    mockFetch([{ status: 404, body: {} }]);
+    assert.equal(await fetchProcessedThrough(TOKEN, REPO), null);
+  });
+
+  test("JSON として読めなければエラーにする", async () => {
+    mockFetch([fileResponse("not json")]);
+    await assert.rejects(fetchProcessedThrough(TOKEN, REPO), GitHubApiError);
+  });
+
+  test("processed_through の形式が不正ならエラーにする", async () => {
+    mockFetch([stateResponse("2026/09/28")]);
+    await assert.rejects(fetchProcessedThrough(TOKEN, REPO), GitHubApiError);
+  });
+
+  test("401 は認証エラーにする", async () => {
+    mockFetch([{ status: 401, body: {} }]);
+    await assert.rejects(fetchProcessedThrough(TOKEN, REPO), GitHubAuthError);
+  });
+});
+
+describe("appendResentRecord", () => {
+  const RECORD = { text: "牛乳を買った", date: "2026-10-02", time: "10:00" };
+  const TODAY = "2026-10-03";
+
+  test("未分類の日付なら元の日付のファイルに書く", async () => {
+    const calls = mockFetch([{ status: 404, body: {} }, { status: 201, body: {} }]);
+    const result = await appendResentRecord(TOKEN, REPO, RECORD, "2026-09-28", TODAY);
+    assert.deepEqual(
+      { url: calls[0].url.endsWith("daily-log/2026-10-02.md"), written: result.writtenDate, redirected: result.isRedirected },
+      { url: true, written: "2026-10-02", redirected: false },
+    );
+  });
+
+  test("元の日付のファイルに同じエントリがあれば書き込まない", async () => {
+    const calls = mockFetch([fileResponse("## 牛乳を買った (10:00)\n")]);
+    const result = await appendResentRecord(TOKEN, REPO, RECORD, "2026-09-28", TODAY);
+    assert.deepEqual({ isDuplicate: result.isDuplicate, callCount: calls.length }, { isDuplicate: true, callCount: 1 });
+  });
+
+  test("分類済みの日付なら今日のファイルに元の日時の注記付きで書く", async () => {
+    const calls = mockFetch([
+      { status: 404, body: {} }, // 元の日付のファイルは無い
+      { status: 404, body: {} }, // 今日のファイルも無い
+      { status: 201, body: {} },
+    ]);
+    const result = await appendResentRecord(TOKEN, REPO, RECORD, "2026-10-02", TODAY);
+    assert.deepEqual(
+      {
+        todayUrl: calls[1].url.endsWith("daily-log/2026-10-03.md"),
+        sent: Buffer.from(putBody(calls[2]).content, "base64").toString("utf-8"),
+        redirected: result.isRedirected,
+        written: result.writtenDate,
+      },
+      {
+        todayUrl: true,
+        sent: "## 牛乳を買った (10:00)\n（元の記録日時: 2026-10-02 10:00。分類済みの日付のため今日のファイルに記録）\n",
+        redirected: true,
+        written: "2026-10-03",
+      },
+    );
+  });
+
+  test("分類済みで元の日付のファイルに記録が既にあれば、今日のファイルにも書かない", async () => {
+    const calls = mockFetch([fileResponse("## 牛乳を買った (10:00)\n")]);
+    const result = await appendResentRecord(TOKEN, REPO, RECORD, "2026-10-02", TODAY);
+    assert.deepEqual(
+      { isDuplicate: result.isDuplicate, content: result.content, callCount: calls.length },
+      { isDuplicate: true, content: null, callCount: 1 },
+    );
+  });
+
+  test("分類済みで今日のファイルに注記付きの同じ記録が既にあれば書き込まない", async () => {
+    const annotated = "## 牛乳を買った (10:00)\n（元の記録日時: 2026-10-02 10:00。分類済みの日付のため今日のファイルに記録）\n";
+    const calls = mockFetch([{ status: 404, body: {} }, fileResponse(annotated)]);
+    const result = await appendResentRecord(TOKEN, REPO, RECORD, "2026-10-02", TODAY);
+    assert.deepEqual({ isDuplicate: result.isDuplicate, callCount: calls.length }, { isDuplicate: true, callCount: 2 });
   });
 });

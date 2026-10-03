@@ -6,8 +6,15 @@
  * 操作を扱う。描画そのものは view.js に任せる。
  */
 
-import { GitHubApiError, GitHubAuthError, appendToDailyLog, fetchDailyLog } from "./github-api.js";
-import { formatEntry, normalizeInput, parseRepoName, toJstDateTime } from "./log-format.js";
+import {
+  GitHubApiError,
+  GitHubAuthError,
+  appendResentRecord,
+  appendToDailyLog,
+  fetchDailyLog,
+  fetchProcessedThrough,
+} from "./github-api.js";
+import { formatEntry, normalizeInput, parseEntries, parseRepoName, toJstDateTime } from "./log-format.js";
 import * as storage from "./storage.js";
 import { renderPending, renderSettings, renderToday, showStatus, ui } from "./view.js";
 
@@ -42,16 +49,21 @@ function openSettingsIfAuthError(error) {
 async function reloadToday() {
   const today = toJstDateTime(new Date()).date;
   ui.todayDate.textContent = `（${today}）`;
-  const token = storage.loadToken();
-  if (!token) {
-    ui.todayMessage.textContent = "設定でトークンを保存すると表示されます";
-    ui.todayList.replaceChildren();
-    return;
-  }
-  ui.todayMessage.textContent = "読み込み中…";
   try {
+    // 端末内の保存が使えない場合の例外も画面に出すため、try の中で読む
+    const token = storage.loadToken();
+    if (!token) {
+      ui.todayMessage.textContent = "設定でトークンを保存すると表示されます";
+      ui.todayList.replaceChildren();
+      return;
+    }
+    ui.todayMessage.textContent = "読み込み中…";
     const { content } = await fetchDailyLog(token, storage.loadRepo(), today);
     renderToday(content);
+    if (parseEntries(content).length === 0) {
+      // 404 は「ファイルが無い」と「リポジトリ名の誤り」を区別できないため補足を出す
+      ui.todayMessage.textContent = "まだ記録はありません（リポジトリ名が正しいかは送信時に確認されます）";
+    }
   } catch (error) {
     ui.todayMessage.textContent = `読み込めませんでした: ${describeError(error)}`;
     openSettingsIfAuthError(error);
@@ -59,10 +71,10 @@ async function reloadToday() {
 }
 
 /**
- * 記録1件を GitHub へ送る。トークンが無ければ認証エラーとして扱う。
+ * 新しい記録1件を GitHub へ送る（重複判定はしない。同じ内容の連続入力を捨てないため）。
+ * トークンが無ければ認証エラーとして扱う。
  *
  * @param {{text: string, date: string, time: string}} record 送る記録（日付・時刻は入力時のもの）
- * @returns {Promise<boolean>} 既に書き込み済みだった（重複として何もしなかった）なら true
  */
 async function sendRecord(record) {
   const token = storage.loadToken();
@@ -75,15 +87,22 @@ async function sendRecord(record) {
   if (record.date === toJstDateTime(new Date()).date) {
     renderToday(result.content);
   }
-  return result.isDuplicate;
 }
+
+/** 処理中かどうか（送信・再送の二重実行を防ぐ） */
+let isBusy = false;
 
 /**
  * ボタンを押せない状態にして処理を実行する（二重送信の防止）。
+ * 処理中に呼ばれた場合は何もしない（Ctrl / Command + Enter はボタンが無効でも送信イベントを起こすため）。
  *
  * @param {() => Promise<void>} task 実行する処理
  */
 async function withButtonsDisabled(task) {
+  if (isBusy) {
+    return;
+  }
+  isBusy = true;
   ui.sendButton.disabled = true;
   ui.resendButton.disabled = true;
   try {
@@ -92,6 +111,7 @@ async function withButtonsDisabled(task) {
     // 各処理で扱いきれなかった例外（端末内への保存失敗など）もここで画面に知らせる
     showStatus("error", describeError(error));
   } finally {
+    isBusy = false;
     ui.sendButton.disabled = false;
     ui.resendButton.disabled = false;
   }
@@ -107,9 +127,9 @@ async function handleSubmit() {
   // 入力した時点の日本時間で日付・時刻を決める（再送しても変わらない）
   const record = { text, ...toJstDateTime(new Date()) };
   try {
-    const isDuplicate = await sendRecord(record);
+    await sendRecord(record);
     ui.entryText.value = "";
-    showStatus("success", isDuplicate ? "送信済みの記録でした（重複して書き込んでいません）" : `送信しました（${record.time}）`);
+    showStatus("success", `送信しました（${record.time}）`);
   } catch (error) {
     try {
       storage.addPending(record);
@@ -126,23 +146,41 @@ async function handleSubmit() {
   ui.entryText.focus();
 }
 
-/** 未送信の記録を古い順に再送する。認証エラーが出たらそこで止める */
+/** 未送信の記録を古い順に再送する。失敗したらそこで止める */
 async function handleResend() {
   let sentCount = 0;
-  for (const record of storage.loadPending()) {
-    try {
-      await sendRecord(record);
-    } catch (error) {
-      renderPending();
-      showStatus("error", `再送に失敗しました（${sentCount}件は送信済み）: ${describeError(error)}`);
-      openSettingsIfAuthError(error);
-      return;
+  let redirectedCount = 0;
+  try {
+    const token = storage.loadToken();
+    if (!token) {
+      throw new GitHubAuthError(401);
     }
-    storage.removePending(record.id);
-    sentCount += 1;
+    const repo = storage.loadRepo();
+    const today = toJstDateTime(new Date()).date;
+    const records = storage.loadPending();
+    // 分類済みの日付の判定に使う状態ファイルは、今日より前の記録があるときだけ1回読む
+    const processedThrough = records.some((record) => record.date < today)
+      ? await fetchProcessedThrough(token, repo)
+      : null;
+    for (const record of records) {
+      // 再送では、通信が途切れたが実は書き込めていた記録の二重書き込みを防ぐため重複判定を行う
+      const result = await appendResentRecord(token, repo, record, processedThrough, today);
+      if (result.writtenDate === today && result.content !== null) {
+        renderToday(result.content);
+      }
+      storage.removePending(record.id);
+      sentCount += 1;
+      redirectedCount += result.isRedirected ? 1 : 0;
+    }
+  } catch (error) {
+    renderPending();
+    showStatus("error", `再送に失敗しました（${sentCount}件は送信済み）: ${describeError(error)}`);
+    openSettingsIfAuthError(error);
+    return;
   }
   renderPending();
-  showStatus("success", `未送信の記録を${sentCount}件送信しました`);
+  const redirectNote = redirectedCount > 0 ? `（うち${redirectedCount}件は分類済みの日付のため、今日の記録として送信しました）` : "";
+  showStatus("success", `未送信の記録を${sentCount}件送信しました${redirectNote}`);
 }
 
 /**

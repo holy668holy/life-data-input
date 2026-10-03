@@ -7,13 +7,17 @@
  */
 
 import {
+  CLASSIFIER_STATE_PATH,
   appendEntry,
   buildCommitMessage,
   buildLogPath,
   containsEntry,
   decodeBase64Utf8,
   encodeBase64Utf8,
+  formatEntry,
+  parseProcessedThrough,
   parseRepoName,
+  resolveTargetDate,
 } from "./log-format.js";
 
 /** GitHub API の接続先（CSP の connect-src と一致させること） */
@@ -113,25 +117,25 @@ function assertOk(response) {
  * Contents API のパスを作る。
  *
  * @param {string} repoFullName `owner/repo`
- * @param {string} date 日付（YYYY-MM-DD）
+ * @param {string} filePath リポジトリ直下からのファイルパス
  * @returns {string} API のパス
  */
-function contentsPath(repoFullName, date) {
+function contentsPath(repoFullName, filePath) {
   const { owner, repo } = parseRepoName(repoFullName);
-  const filePath = buildLogPath(date).split("/").map(encodeURIComponent).join("/");
-  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${filePath}`;
+  const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`;
 }
 
 /**
- * 指定日の daily-log ファイルを取得する。
+ * リポジトリ内のファイルを取得する。
  *
  * @param {string} token アクセストークン
  * @param {string} repoFullName `owner/repo`
- * @param {string} date 日付（YYYY-MM-DD）
+ * @param {string} filePath リポジトリ直下からのファイルパス
  * @returns {Promise<{content: string, sha: string | null}>} 内容と sha。ファイルが無ければ空文字と null
  */
-export async function fetchDailyLog(token, repoFullName, date) {
-  const response = await callApi(token, contentsPath(repoFullName, date));
+async function fetchRepoFile(token, repoFullName, filePath) {
+  const response = await callApi(token, contentsPath(repoFullName, filePath));
   if (response.status === 404) {
     // 404 は「ファイルが無い」と「リポジトリが見えない」の両方がありうる。
     // 後者は書き込み時の PUT でも 404 になり、そこで利用者に伝わる
@@ -146,26 +150,59 @@ export async function fetchDailyLog(token, repoFullName, date) {
 }
 
 /**
+ * 指定日の daily-log ファイルを取得する。
+ *
+ * @param {string} token アクセストークン
+ * @param {string} repoFullName `owner/repo`
+ * @param {string} date 日付（YYYY-MM-DD）
+ * @returns {Promise<{content: string, sha: string | null}>} 内容と sha。ファイルが無ければ空文字と null
+ */
+export function fetchDailyLog(token, repoFullName, date) {
+  return fetchRepoFile(token, repoFullName, buildLogPath(date));
+}
+
+/**
+ * 分類 Skill の状態ファイルから、分類済みの最終日（`processed_through`）を取得する。
+ *
+ * @param {string} token アクセストークン
+ * @param {string} repoFullName `owner/repo`
+ * @returns {Promise<string | null>} 分類済みの最終日（YYYY-MM-DD）。状態ファイルが無ければ null
+ */
+export async function fetchProcessedThrough(token, repoFullName) {
+  const { content } = await fetchRepoFile(token, repoFullName, CLASSIFIER_STATE_PATH);
+  try {
+    return parseProcessedThrough(content);
+  } catch (error) {
+    // 形式が不正なら黙って元の日付に書かず、未送信に残すためエラーにする（Fail Fast）
+    throw new GitHubApiError(error instanceof Error ? error.message : String(error), null);
+  }
+}
+
+/**
  * 指定日の daily-log ファイルの末尾にエントリを追記する。
  *
  * 同時に別の書き込みがあって sha が古くなっていた場合は、取得からやり直す。
- * 同じエントリが既に書き込まれていれば何もしない（再送時の二重書き込み防止）。
+ * `skipIfDuplicate` が true で同じエントリが既に書き込まれていれば何もしない
+ * （通信が途中で切れたが実は書き込めていた記録の、再送時の二重書き込み防止）。
  *
  * @param {string} token アクセストークン
  * @param {string} repoFullName `owner/repo`
  * @param {string} date 日付（YYYY-MM-DD）
  * @param {string} entry formatEntry で作ったエントリ
- * @param {number} [retryBaseDelayMs] やり直し前の待ち時間の基準値（テストで短くするために指定できる）
+ * @param {{skipIfDuplicate?: boolean, retryBaseDelayMs?: number}} [options]
+ *   skipIfDuplicate: 重複判定を行うか（既定 false。再送時だけ true にする）。
+ *   retryBaseDelayMs: やり直し前の待ち時間の基準値（テストで短くするために指定できる）
  * @returns {Promise<{content: string, isDuplicate: boolean}>} 書き込み後のファイル内容と、既に書き込み済みだったか
  */
-export async function appendToDailyLog(token, repoFullName, date, entry, retryBaseDelayMs = RETRY_BASE_DELAY_MS) {
+export async function appendToDailyLog(token, repoFullName, date, entry, options = {}) {
+  const { skipIfDuplicate = false, retryBaseDelayMs = RETRY_BASE_DELAY_MS } = options;
   for (let attempt = 0; ; attempt += 1) {
     const current = await fetchDailyLog(token, repoFullName, date);
-    if (containsEntry(current.content, entry)) {
+    if (skipIfDuplicate && containsEntry(current.content, entry)) {
       return { content: current.content, isDuplicate: true };
     }
     const nextContent = appendEntry(current.content, entry);
-    const response = await callApi(token, contentsPath(repoFullName, date), {
+    const response = await callApi(token, contentsPath(repoFullName, buildLogPath(date)), {
       method: "PUT",
       body: JSON.stringify({
         message: buildCommitMessage(date),
@@ -185,6 +222,43 @@ export async function appendToDailyLog(token, repoFullName, date, entry, retryBa
     }
     await sleep(retryBaseDelayMs * 2 ** attempt);
   }
+}
+
+/**
+ * 未送信の記録を再送する（重複判定あり）。
+ *
+ * 元の記録日が分類済み（`processedThrough` 以前）なら、今日のファイルへ元の日時の注記付きで書く。
+ * その場合、元の日付のファイルに既に同じ記録が入っていれば（以前の送信が実は成功していた）、書き込まない。
+ *
+ * @param {string} token アクセストークン
+ * @param {string} repoFullName `owner/repo`
+ * @param {{text: string, date: string, time: string}} record 再送する記録（日付・時刻は入力時のもの）
+ * @param {string | null} processedThrough 分類済みの最終日（状態ファイルが無ければ null）
+ * @param {string} today 今日の日付（YYYY-MM-DD）
+ * @param {{retryBaseDelayMs?: number}} [options] appendToDailyLog に渡すオプション
+ * @returns {Promise<{content: string | null, writtenDate: string, isDuplicate: boolean, isRedirected: boolean}>}
+ *   書き込み後の内容（元の日付で重複と分かった場合は null）、書き込み先の日付、重複だったか、今日へ振り替えたか
+ */
+export async function appendResentRecord(token, repoFullName, record, processedThrough, today, options = {}) {
+  const targetDate = resolveTargetDate(record.date, processedThrough, today);
+  if (targetDate === record.date) {
+    const result = await appendToDailyLog(token, repoFullName, targetDate, formatEntry(record.text, record.time), {
+      ...options,
+      skipIfDuplicate: true,
+    });
+    return { ...result, writtenDate: targetDate, isRedirected: false };
+  }
+  // 振り替える場合: 以前の送信が元の日付のファイルに書けていないかを先に確認する
+  const original = await fetchDailyLog(token, repoFullName, record.date);
+  if (containsEntry(original.content, formatEntry(record.text, record.time))) {
+    return { content: null, writtenDate: record.date, isDuplicate: true, isRedirected: true };
+  }
+  const annotatedEntry = formatEntry(record.text, record.time, record.date);
+  const result = await appendToDailyLog(token, repoFullName, targetDate, annotatedEntry, {
+    ...options,
+    skipIfDuplicate: true,
+  });
+  return { ...result, writtenDate: targetDate, isRedirected: true };
 }
 
 /**

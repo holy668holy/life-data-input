@@ -12,6 +12,9 @@ export const LOG_TIME_ZONE = "Asia/Tokyo";
 /** daily-log の置き場所（リポジトリ直下からの相対パス） */
 const DAILY_LOG_DIR = "daily-log";
 
+/** 分類 Skill の状態ファイル（リポジトリ直下からの相対パス） */
+export const CLASSIFIER_STATE_PATH = `${DAILY_LOG_DIR}/.claude_integration_state.json`;
+
 /** 日本時間の日付・時刻を求めるためのフォーマッタ（毎回生成しないよう使い回す） */
 const JST_FORMATTER = new Intl.DateTimeFormat("en-CA", {
   timeZone: LOG_TIME_ZONE,
@@ -89,12 +92,15 @@ export function escapeBodyLine(line) {
  * 入力テキストを daily-log のエントリ（末尾改行なし）に整形する。
  *
  * 1行目を `## <1行目> (HH:MM)` の見出しにし、2行目以降はその下に本文として続ける。
+ * 分類済みの日付の記録を今日のファイルへ振り替える場合は、`originalDate` を指定すると
+ * 本文の先頭に元の記録日時の注記行が入る（見出しの時刻は元の入力時刻のまま）。
  *
  * @param {string} text 正規化済みの入力テキスト（normalizeInput の戻り値）
  * @param {string} time 日本時間の時刻（HH:MM）
+ * @param {string | null} [originalDate] 元の記録日（YYYY-MM-DD）。振り替えない通常の記録では指定しない
  * @returns {string} エントリ文字列
  */
-export function formatEntry(text, time) {
+export function formatEntry(text, time, originalDate = null) {
   if (!/^\d{2}:\d{2}$/.test(time)) {
     throw new Error(`時刻の形式が不正です: ${time}`);
   }
@@ -106,6 +112,11 @@ export function formatEntry(text, time) {
   const heading = `## ${firstLine.trim()} (${time})`;
   // 本文の行末の空白は Markdown の改行指定と誤解されやすいので除去する
   const body = bodyLines.map((line) => escapeBodyLine(line.trimEnd()));
+  if (originalDate !== null) {
+    assertDate(originalDate);
+    // 注記は `#` で始まらない固定形式の行。分類 Skill はこの日付を記録の日付として扱う
+    body.unshift(`（元の記録日時: ${originalDate} ${time}。分類済みの日付のため今日のファイルに記録）`);
+  }
   return [heading, ...body].join("\n");
 }
 
@@ -129,14 +140,71 @@ export function appendEntry(existing, entry) {
 /**
  * ファイル内容に同じエントリが既に含まれているかを判定する（再送時の二重書き込み防止用）。
  *
+ * ファイルを見出し行（`## ` で始まる行）ごとのブロックに分け、ブロック全体（末尾の空白・空行を除く）が
+ * エントリと完全に一致するときだけ重複とする。前方一致では別の記録を重複と誤判定するため。
+ * 本文の行は `escapeBodyLine` により `## ` で始まらないので、見出しで区切れる。
+ *
  * @param {string} content ファイル内容
  * @param {string} entry formatEntry で作ったエントリ
  * @returns {boolean} 含まれていれば true
  */
 export function containsEntry(content, entry) {
-  // 行単位で比較し、見出し行の部分一致（別エントリの途中に一致）を避ける
-  const normalizedContent = `\n${content.replace(/\r\n?/g, "\n")}\n`;
-  return normalizedContent.includes(`\n${entry}\n`);
+  /** @type {string[][]} */
+  const blocks = [];
+  for (const line of content.replace(/\r\n?/g, "\n").split("\n")) {
+    if (line.startsWith("## ")) {
+      blocks.push([line]);
+    } else if (blocks.length > 0) {
+      blocks[blocks.length - 1].push(line);
+    }
+  }
+  return blocks.some((block) => block.join("\n").replace(/\s+$/, "") === entry);
+}
+
+/**
+ * 再送する記録の書き込み先の日付を決める。
+ *
+ * 元の記録日が分類済み（`processedThrough` 以前）だと、元の日付のファイルに書いても分類されないため、
+ * 今日のファイルへ振り替える。それ以外は元の記録日のファイルに書く。
+ *
+ * @param {string} recordDate 元の記録日（YYYY-MM-DD）
+ * @param {string | null} processedThrough 分類済みの最終日（状態ファイルが無ければ null）
+ * @param {string} today 今日の日付（YYYY-MM-DD）
+ * @returns {string} 書き込み先の日付
+ */
+export function resolveTargetDate(recordDate, processedThrough, today) {
+  assertDate(recordDate);
+  assertDate(today);
+  if (processedThrough === null) {
+    return recordDate;
+  }
+  assertDate(processedThrough);
+  // YYYY-MM-DD は文字列比較で日付の前後を判定できる
+  return recordDate <= processedThrough ? today : recordDate;
+}
+
+/**
+ * 分類 Skill の状態ファイルの内容から、分類済みの最終日を取り出す。
+ *
+ * @param {string} content 状態ファイルの内容（ファイルが無ければ空文字）
+ * @returns {string | null} `processed_through`（YYYY-MM-DD）。ファイルが無ければ null
+ */
+export function parseProcessedThrough(content) {
+  if (content.trim() === "") {
+    return null;
+  }
+  /** @type {unknown} */
+  let data;
+  try {
+    data = JSON.parse(content);
+  } catch {
+    throw new Error("分類の状態ファイルが JSON として読めません。分類されない記録を作らないため再送を止めました");
+  }
+  const value = data !== null && typeof data === "object" ? /** @type {Record<string, unknown>} */ (data).processed_through : undefined;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error("分類の状態ファイルの processed_through が不正です。分類されない記録を作らないため再送を止めました");
+  }
+  return value;
 }
 
 /**

@@ -13,7 +13,9 @@ import {
   formatEntry,
   normalizeInput,
   parseEntries,
+  parseProcessedThrough,
   parseRepoName,
+  resolveTargetDate,
   toJstDateTime,
 } from "../log-format.js";
 
@@ -131,6 +133,79 @@ describe("containsEntry", () => {
 
   test("行の途中に一致するだけなら false", () => {
     assert.equal(containsEntry("## 牛乳とパン (10:00)\n", "パン (10:00)"), false);
+  });
+
+  test("1行入力が、同じ見出しの複数行エントリの前方と一致しても false", () => {
+    assert.equal(containsEntry("## 牛乳を買った (10:00)\n200円\n", "## 牛乳を買った (10:00)"), false);
+  });
+
+  test("本文の前方だけが一致する別エントリは false", () => {
+    assert.equal(containsEntry("## A (10:00)\nB\nC\n", "## A (10:00)\nB"), false);
+  });
+
+  test("複数行エントリが完全に一致すれば true", () => {
+    assert.equal(containsEntry("## x (09:00)\n\n## A (10:00)\nB\nC\n\n## y (11:00)\n", "## A (10:00)\nB\nC"), true);
+  });
+
+  test("CRLF のファイルでも一致を判定できる", () => {
+    assert.equal(containsEntry("## a (10:00)\r\nb\r\n", "## a (10:00)\nb"), true);
+  });
+});
+
+describe("formatEntry の元の記録日時の注記", () => {
+  test("originalDate を指定すると本文の先頭に注記が入り、見出しの時刻は元のまま", () => {
+    assert.equal(
+      formatEntry("牛乳\n200円", "10:00", "2026-10-02"),
+      "## 牛乳 (10:00)\n（元の記録日時: 2026-10-02 10:00。分類済みの日付のため今日のファイルに記録）\n200円",
+    );
+  });
+
+  test("originalDate の形式が不正ならエラー", () => {
+    assert.throws(() => formatEntry("牛乳", "10:00", "10/02"), /日付の形式が不正/);
+  });
+});
+
+describe("resolveTargetDate", () => {
+  test("分類済みの日付は今日に振り替える", () => {
+    assert.equal(resolveTargetDate("2026-10-02", "2026-10-02", "2026-10-03"), "2026-10-03");
+  });
+
+  test("processed_through より前の日付も今日に振り替える", () => {
+    assert.equal(resolveTargetDate("2026-09-30", "2026-10-02", "2026-10-03"), "2026-10-03");
+  });
+
+  test("未分類の日付は元の日付のまま", () => {
+    assert.equal(resolveTargetDate("2026-10-02", "2026-10-01", "2026-10-03"), "2026-10-02");
+  });
+
+  test("状態ファイルが無ければ元の日付のまま", () => {
+    assert.equal(resolveTargetDate("2026-10-02", null, "2026-10-03"), "2026-10-02");
+  });
+
+  test("今日の記録は今日のまま", () => {
+    assert.equal(resolveTargetDate("2026-10-03", "2026-10-02", "2026-10-03"), "2026-10-03");
+  });
+});
+
+describe("parseProcessedThrough", () => {
+  test("processed_through を取り出す", () => {
+    assert.equal(parseProcessedThrough('{"processed_through": "2026-09-28"}'), "2026-09-28");
+  });
+
+  test("空なら null", () => {
+    assert.equal(parseProcessedThrough(""), null);
+  });
+
+  test("JSON でなければエラー", () => {
+    assert.throws(() => parseProcessedThrough("{"), /JSON/);
+  });
+
+  test("processed_through が無い・形式が違えばエラー", () => {
+    assert.throws(() => parseProcessedThrough('{"processed_through": 20260928}'), /processed_through/);
+  });
+
+  test("JSON が配列や null でもエラー", () => {
+    assert.throws(() => parseProcessedThrough("null"), /processed_through/);
   });
 });
 
