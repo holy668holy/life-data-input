@@ -1,0 +1,19 @@
+{
+  "name": "生活ログ入力",
+  "short_name": "生活ログ",
+  "description": "生活ログを GitHub の daily-log に送る入力ページ",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f7f5",
+  "theme_color": "#2f6f4f",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <!--
+    外部スクリプトの読み込みを禁止し、通信先を GitHub API だけに限定する（トークン流出対策）。
+    スタイル・スクリプト・画像・manifest は同じ場所（'self'）からのみ読み込む。
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.github.com; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="生活ログを GitHub の daily-log に送る入力ページ">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#2f6f4f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="生活ログ">
+  <title>生活ログ入力</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.png" type="image/png">
+  <link rel="apple-touch-icon" href="icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <h1 class="page__title">生活ログ</h1>
+
+    <!-- 入力欄と送信ボタン -->
+    <form id="entry-form" class="entry-form" novalidate>
+      <label for="entry-text" class="entry-form__label">記録する内容（1行目が見出しになります）</label>
+      <textarea id="entry-text" class="entry-form__text" rows="4" autofocus
+                placeholder="例: スーパーで牛乳を買った"></textarea>
+      <button id="send-button" type="submit" class="button button--primary">送信</button>
+    </form>
+
+    <!-- 送信結果（読み上げにも伝わるよう role="status" にする） -->
+    <p id="status" class="status" role="status" aria-live="polite" hidden></p>
+
+    <!-- 未送信の記録（ある場合のみ表示） -->
+    <section id="pending-section" class="section" aria-labelledby="pending-title" hidden>
+      <h2 id="pending-title" class="section__title">未送信の記録</h2>
+      <ul id="pending-list" class="entry-list"></ul>
+      <button id="resend-button" type="button" class="button">まとめて再送</button>
+    </section>
+
+    <!-- 今日送信した記録 -->
+    <section class="section" aria-labelledby="today-title">
+      <h2 id="today-title" class="section__title">今日の記録 <span id="today-date" class="section__note"></span></h2>
+      <p id="today-message" class="section__note"></p>
+      <ul id="today-list" class="entry-list"></ul>
+      <button id="reload-button" type="button" class="button">最新の状態を読み込む</button>
+    </section>
+
+    <!-- 設定（トークン・対象リポジトリ） -->
+    <details id="settings" class="section settings">
+      <summary class="section__title">設定</summary>
+      <p class="section__note">トークン: <span id="token-state">未設定</span></p>
+      <form id="token-form" class="settings__form" novalidate>
+        <label for="token-input">GitHub のアクセストークン（この端末のブラウザにだけ保存されます）</label>
+        <input id="token-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <div class="settings__buttons">
+          <button type="submit" class="button button--primary">保存</button>
+          <button id="token-delete" type="button" class="button">保存済みトークンを削除</button>
+        </div>
+      </form>
+      <form id="repo-form" class="settings__form" novalidate>
+        <label for="repo-input">書き込み先リポジトリ（所有者/リポジトリ名）</label>
+        <input id="repo-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button type="submit" class="button">保存</button>
+      </form>
+    </details>
+  </main>
+</body>
+</html>
